@@ -21,6 +21,7 @@
 #include <linux/mutex.h>
 #include <linux/pid.h>
 #include <linux/sched/signal.h>
+#include <linux/spinlock.h>
 #include <linux/slab.h>
 #include <linux/timer.h>
 #include <linux/uaccess.h>
@@ -39,6 +40,14 @@
  *   - remember whether the soft-limit warning was already emitted
  *   - include `struct list_head` linkage
  * ============================================================== */
+struct monitored_entry {
+    pid_t pid;
+    unsigned long soft_limit_bytes;
+    unsigned long hard_limit_bytes;
+    char container_id[MONITOR_NAME_LEN];
+    int soft_limit_reported;
+    struct list_head list;
+};
 
 
 /* ==============================================================
@@ -51,6 +60,8 @@
  * You may choose either a mutex or a spinlock, but your README must
  * justify the choice in terms of the code paths you implemented.
  * ============================================================== */
+static LIST_HEAD(monitored_list);
+static DEFINE_SPINLOCK(monitored_lock);
 
 
 /* --- Provided: internal device / timer state --- */
@@ -133,6 +144,12 @@ static void kill_process(const char *container_id,
  * --------------------------------------------------------------- */
 static void timer_callback(struct timer_list *t)
 {
+    struct monitored_entry *entry;
+    struct monitored_entry *tmp;
+    unsigned long flags;
+
+    (void)t;
+
     /* ==============================================================
      * TODO 3: Implement periodic monitoring.
      *
@@ -143,6 +160,40 @@ static void timer_callback(struct timer_list *t)
      *   - enforce hard limit and then remove the entry
      *   - avoid use-after-free while deleting during iteration
      * ============================================================== */
+    spin_lock_irqsave(&monitored_lock, flags);
+    list_for_each_entry_safe(entry, tmp, &monitored_list, list) {
+        long rss_bytes = get_rss_bytes(entry->pid);
+
+        if (rss_bytes < 0) {
+            printk(KERN_INFO
+                   "[container_monitor] Removing stale entry container=%s pid=%d\n",
+                   entry->container_id,
+                   entry->pid);
+            list_del(&entry->list);
+            kfree(entry);
+            continue;
+        }
+
+        if (!entry->soft_limit_reported && entry->soft_limit_bytes > 0 &&
+            rss_bytes > (long)entry->soft_limit_bytes) {
+            entry->soft_limit_reported = 1;
+            log_soft_limit_event(entry->container_id,
+                                 entry->pid,
+                                 entry->soft_limit_bytes,
+                                 rss_bytes);
+        }
+
+        if (entry->hard_limit_bytes > 0 &&
+            rss_bytes > (long)entry->hard_limit_bytes) {
+            kill_process(entry->container_id,
+                         entry->pid,
+                         entry->hard_limit_bytes,
+                         rss_bytes);
+            list_del(&entry->list);
+            kfree(entry);
+        }
+    }
+    spin_unlock_irqrestore(&monitored_lock, flags);
 
     mod_timer(&monitor_timer, jiffies + CHECK_INTERVAL_SEC * HZ);
 }
@@ -167,6 +218,17 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         return -EFAULT;
 
     if (cmd == MONITOR_REGISTER) {
+        struct monitored_entry *entry;
+        struct monitored_entry *iter;
+        struct monitored_entry *tmp;
+        unsigned long flags;
+
+        req.container_id[MONITOR_NAME_LEN - 1] = '\0';
+
+        if (req.pid <= 0 || req.hard_limit_bytes == 0 ||
+            req.soft_limit_bytes > req.hard_limit_bytes)
+            return -EINVAL;
+
         printk(KERN_INFO
                "[container_monitor] Registering container=%s pid=%d soft=%lu hard=%lu\n",
                req.container_id, req.pid, req.soft_limit_bytes, req.hard_limit_bytes);
@@ -179,6 +241,28 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
          *   - validate allocation and limits
          *   - insert into the shared list under the chosen lock
          * ============================================================== */
+        entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+        if (!entry)
+            return -ENOMEM;
+
+        entry->pid = req.pid;
+        entry->soft_limit_bytes = req.soft_limit_bytes;
+        entry->hard_limit_bytes = req.hard_limit_bytes;
+        entry->soft_limit_reported = 0;
+        strscpy(entry->container_id, req.container_id, sizeof(entry->container_id));
+
+        if (entry->container_id[0] == '\0')
+            strscpy(entry->container_id, "unknown", sizeof(entry->container_id));
+
+        spin_lock_irqsave(&monitored_lock, flags);
+        list_for_each_entry_safe(iter, tmp, &monitored_list, list) {
+            if (iter->pid == entry->pid) {
+                list_del(&iter->list);
+                kfree(iter);
+            }
+        }
+        list_add_tail(&entry->list, &monitored_list);
+        spin_unlock_irqrestore(&monitored_lock, flags);
 
         return 0;
     }
@@ -186,6 +270,8 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
     printk(KERN_INFO
            "[container_monitor] Unregister request container=%s pid=%d\n",
            req.container_id, req.pid);
+
+    req.container_id[MONITOR_NAME_LEN - 1] = '\0';
 
     /* ==============================================================
      * TODO 5: Remove a monitored entry on explicit unregister.
@@ -195,6 +281,31 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
      *   - remove the matching entry safely if found
      *   - return status indicating whether a matching entry was removed
      * ============================================================== */
+    {
+        struct monitored_entry *entry;
+        struct monitored_entry *tmp;
+        unsigned long flags;
+        int removed = 0;
+
+        spin_lock_irqsave(&monitored_lock, flags);
+        list_for_each_entry_safe(entry, tmp, &monitored_list, list) {
+            int pid_match = (entry->pid == req.pid);
+            int id_match = (req.container_id[0] == '\0' ||
+                            strncmp(entry->container_id,
+                                    req.container_id,
+                                    sizeof(entry->container_id)) == 0);
+
+            if (pid_match && id_match) {
+                list_del(&entry->list);
+                kfree(entry);
+                removed = 1;
+                break;
+            }
+        }
+        spin_unlock_irqrestore(&monitored_lock, flags);
+
+        return removed ? 0 : -ENOENT;
+    }
 
     return -ENOENT;
 }
@@ -245,7 +356,11 @@ static int __init monitor_init(void)
 /* --- Provided: Module Exit --- */
 static void __exit monitor_exit(void)
 {
-    del_timer_sync(&monitor_timer);
+    struct monitored_entry *entry;
+    struct monitored_entry *tmp;
+    unsigned long flags;
+
+    timer_shutdown_sync(&monitor_timer);
 
     /* ==============================================================
      * TODO 6: Free all remaining monitored entries.
@@ -254,6 +369,12 @@ static void __exit monitor_exit(void)
      *   - remove and free every list node safely
      *   - leave no leaked state on module unload
      * ============================================================== */
+    spin_lock_irqsave(&monitored_lock, flags);
+    list_for_each_entry_safe(entry, tmp, &monitored_list, list) {
+        list_del(&entry->list);
+        kfree(entry);
+    }
+    spin_unlock_irqrestore(&monitored_lock, flags);
 
     cdev_del(&c_dev);
     device_destroy(cl, dev_num);
