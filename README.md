@@ -66,6 +66,21 @@ To run helper binaries inside a container, copy them into that container's rootf
 cp workload_binary ./rootfs-alpha/
 ```
 
+### `3. Demo with Screenshots`
+
+Each screenshot below includes a short caption and is mapped to the required rubric item.
+
+| # | What to Demonstrate | What the Screenshot Must Show | Screenshot(s) and Brief Caption |
+| --- | --- | --- | --- |
+| 1 | Multi-container supervision | Two or more containers running under one supervisor process | `assets/alpha_beta_task1.png` - two containers (`alpha`, `beta`) launched and tracked under one running supervisor |
+| 2 | Metadata tracking | Output of `ps` showing tracked container metadata | `assets/alpha_beta_task2.png` - `engine ps` output with ID, PID, state, limits, and start-time metadata |
+| 3 | Bounded-buffer logging | Log contents captured through logging pipeline and evidence pipeline is active | `assets/alpha_beta_task3.png` - per-container logs show stdout/stderr capture through supervisor logging path |
+| 4 | CLI and IPC | CLI command issued and supervisor response (second IPC mechanism) | `assets/supervisor_task2.png`, `assets/alpha_beta_task2.png` - CLI commands communicate with persistent supervisor over control channel |
+| 5 | Soft-limit warning | `dmesg` or log output showing soft-limit warning event | `assets/task4_soft_limit_terminal.png` - soft-limit test workflow and filtered kernel warning output |
+| 6 | Hard-limit enforcement | Container killed after hard-limit breach and supervisor metadata reflecting kill | `assets/task4_hard_limit_terminal.png` - hard-limit test workflow and metadata lookup for enforced kill |
+| 7 | Scheduling experiment | Terminal measurements showing observable differences between configurations | `assets/task5_setup_and_launch.png`, `assets/task5_results_summary.png` - launch + extracted timing/accumulator comparison |
+| 8 | Clean teardown | Evidence of reaping, thread exit path completion, and no zombies after shutdown | `assets/task6_activity_and_ps.png`, `assets/task6_cleanup_checks.png`, `assets/task6_no_zombies_and_empty_ps.png` - teardown diagnostics and post-restart empty metadata |
+
 
 ### `TASK 1`
 
@@ -569,5 +584,139 @@ Expected: `No containers tracked.`
 - User-space heap resources released: validated operationally by repeated clean shutdown/start cycles without process residue.
 - Kernel list entries freed on module unload: validated by successful `rmmod` followed by `insmod` without stale in-use errors.
 - No lingering zombie processes or stale metadata: validated by zombie check + fresh `ps` output after restart.
+
+### `4. Engineering Analysis`
+
+#### Isolation Mechanisms
+
+The runtime uses Linux namespaces to give each container its own process and system view while still sharing the host kernel.
+
+- `PID` namespace gives each container an independent process tree so PID values seen inside the container are local to that namespace.
+- `UTS` namespace isolates hostname/domainname so container identity can differ from host identity.
+- `mount` namespace isolates mount-table state so container mount operations (such as mounting `/proc`) do not modify the host mount namespace.
+- `chroot` changes the process root directory to a container-specific rootfs (`rootfs-alpha`, `rootfs-beta`) and limits path traversal to that tree in normal operation.
+
+Even with these boundaries, all containers still share the same host kernel image and kernel scheduler. Namespaces virtualize views of resources; they do not create separate kernels.
+
+#### Supervisor and Process Lifecycle
+
+A long-running supervisor is useful because container management is a lifecycle problem, not a single `fork/exec` event.
+
+- The supervisor is the stable parent for all container children, so it can reap exits reliably (`waitpid`) and avoid zombie accumulation.
+- Metadata (ID, PID, limits, state, timestamps, termination reason) lives in one authoritative process, which prevents split-brain state across short-lived clients.
+- CLI tools remain short-lived request/response clients while lifecycle ownership stays centralized in the supervisor.
+- Signal delivery semantics are explicit: stop requests are intentional control-plane actions, while asynchronous exits (including hard-limit `SIGKILL`) are classified during reap.
+
+This design matches Unix process semantics: parent process responsibility includes child tracking, exit-status collection, and signal-policy enforcement.
+
+#### IPC, Threads, and Synchronization
+
+The runtime uses two IPC paths with different responsibilities.
+
+- Path A (logging): container stdout/stderr pipes into supervisor.
+- Path B (control): CLI-to-supervisor command channel.
+
+Shared structures and race conditions:
+
+- Bounded log queue (ring buffer): without locking, concurrent producer/consumer updates can corrupt head/tail/count.
+- Container metadata table: without synchronization, CLI handlers, reap path, and logger lookups can read/write torn or stale state.
+- Kernel monitored-process list: without lock protection, ioctl registration/unregistration can race timer-based RSS scanning.
+
+Synchronization choices:
+
+- `pthread_mutex` + `pthread_cond` for bounded queue provide correctness plus blocking semantics (`not_full`, `not_empty`) instead of CPU-burning spin loops.
+- A separate metadata lock reduces lock-scope overlap with queue operations and lowers deadlock/priority-inversion risk.
+- Kernel `spinlock` is appropriate because timer context cannot sleep and list updates are short critical sections.
+
+#### Memory Management and Enforcement
+
+RSS (resident set size) approximates the portion of a process address space currently backed by physical memory pages.
+
+- RSS reflects resident pages and is useful for runtime pressure detection.
+- RSS is not total virtual memory size; it does not directly equal all mapped address space or guarantee accounting of non-resident pages.
+
+Soft and hard limits are intentionally different policy tiers:
+
+- Soft limit: early-warning threshold to surface pressure before forced intervention.
+- Hard limit: safety boundary where progress is traded for system protection via termination.
+
+Enforcement belongs in kernel space because only the kernel has authoritative scheduling/memory visibility and the privilege to enforce process termination consistently under contention. A user-space-only monitor can be delayed, preempted, or bypassed in ways kernel enforcement cannot.
+
+#### Scheduling Behavior
+
+The experiments exercise CFS behavior through mixed workloads and priority changes.
+
+- CPU-bound vs I/O-bound (same nice): I/O tasks sleep/wake frequently and often regain CPU quickly, improving responsiveness.
+- CPU-bound vs CPU-bound (different nice): lower nice value receives larger weight under CFS, increasing effective CPU share and observable progress over equal wall time.
+
+This reflects scheduler goals:
+
+- Fairness: weighted fair sharing, not strict equal slices.
+- Responsiveness: interactive/waking tasks are serviced quickly.
+- Throughput: sustained CPU-bound tasks continue making progress while policy weights determine relative share.
+
+### `5. Design Decisions and Tradeoffs`
+
+| Subsystem | Design Choice | Tradeoff | Justification |
+| --- | --- | --- | --- |
+| Namespace isolation | `clone` with PID/UTS/mount namespaces + per-container rootfs via `chroot` | `chroot` is simpler than `pivot_root` but less strict against some escape classes if misconfigured | Meets project isolation scope while keeping implementation understandable and debuggable |
+| Supervisor architecture | Single long-lived supervisor daemon with short-lived CLI clients | Adds always-on process complexity and explicit shutdown handling | Centralizes lifecycle, metadata, reaping, and policy decisions in one authority |
+| IPC/logging | Separate control channel and pipe-based logging with bounded producer-consumer queue | More moving parts (threads, queue, condition variables) than direct terminal forwarding | Decouples bursty output from disk writes, prevents uncontrolled memory growth, and preserves logs |
+| Kernel monitor | ioctl registration + timer-driven RSS scan + soft/hard policy | Timer-based polling has detection latency vs event-driven hooks | Simpler, testable enforcement path that still provides consistent kernel-level policy |
+| Scheduling experiments | Nice-level comparisons plus concurrent mixed workloads | Results can vary across host load and VM scheduling noise | Still exposes repeatable directional behavior of CFS fairness and responsiveness |
+
+### `6. Scheduler Experiment Results`
+
+Raw experiment evidence is captured in:
+
+- `assets/task5_setup_and_launch.png`
+- `assets/task5_results_summary.png`
+
+Measured artifacts (generated during Task 5 flow):
+
+- elapsed time files (`*.time`) from `/usr/bin/time`
+- run-status output (`*.out`) from `engine run`
+- workload logs (`*.log`) including final `accumulator` values for CPU-bound comparison
+
+Side-by-side comparison from the recorded experiment format:
+
+| Comparison | Observable Signal | Interpretation |
+| --- | --- | --- |
+| CPU-bound + I/O-bound (same nice) | completion times and run-status lines differ by workload behavior | I/O-bound task sleeps/wakes and remains responsive; CPU-bound task consumes sustained slices |
+| CPU-bound high priority vs low priority | final `accumulator` and elapsed-time differences | lower nice (higher priority) receives larger effective CPU share under CFS |
+
+What the results show:
+
+- Linux CFS delivers weighted fairness, not identical progress across unequal priorities.
+- Responsiveness and throughput are jointly optimized: waking tasks stay responsive while CPU-heavy tasks still progress.
+
+### `Boilerplate Contents`
+
+The `boilerplate/` folder provides starter structure for implementation and testing:
+
+- user-space runtime/supervisor source (`engine.c`)
+- kernel monitor source (`monitor.c`)
+- shared ioctl definitions (`monitor_ioctl.h`)
+- workload programs for memory and scheduling experiments (`memory_hog.c`, `cpu_hog.c`, `io_pulse.c`)
+- build flow (`Makefile`)
+
+### `Submission Package Checklist`
+
+Required source files for submission:
+
+- `boilerplate/engine.c`
+- `boilerplate/monitor.c`
+- `boilerplate/monitor_ioctl.h`
+- workload/test programs (at least two)
+- `boilerplate/Makefile`
+- `README.md`
+
+CI-safe smoke-check command expected to pass:
+
+```bash
+make -C boilerplate ci
+```
+
+This CI check validates user-space compilation only; full validation still requires VM execution with module load, supervisor run, rootfs setup, and runtime experiments.
 
 
