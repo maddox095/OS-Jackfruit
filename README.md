@@ -66,33 +66,6 @@ To run helper binaries inside a container, copy them into that container's rootf
 cp workload_binary ./rootfs-alpha/
 ```
 
-### `Reset Before Item 7 and Item 8`
-
-Run these once before capturing the new Item 7 and Item 8 screenshots.
-
-```bash
-cd /home/maddox/Desktop/OS-Jackfruit/boilerplate
-
-# Stop any stale supervisor process and clear stale socket
-sudo pkill -f "./engine supervisor ./rootfs-base" || true
-sudo rm -f /tmp/mini_runtime.sock
-
-# Reset monitor module state
-sudo rmmod monitor 2>/dev/null || true
-sudo insmod monitor.ko
-
-# Rebuild workloads and ensure they are runnable in container rootfs trees
-make cpu_hog io_pulse
-cp ./cpu_hog ./rootfs-alpha/cpu_hog
-cp ./cpu_hog ./rootfs-beta/cpu_hog
-cp ./io_pulse ./rootfs-alpha/io_pulse
-cp ./io_pulse ./rootfs-beta/io_pulse
-chmod +x ./rootfs-alpha/cpu_hog ./rootfs-beta/cpu_hog
-chmod +x ./rootfs-alpha/io_pulse ./rootfs-beta/io_pulse
-```
-
-
-
 
 ### `TASK 1`
 
